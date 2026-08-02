@@ -4,6 +4,8 @@ A small, standalone core for the **TB32** instruction set, a fixed-width 32-bit 
 architecture. It provides the ISA (encode/decode), an assembler, a host-agnostic CPU 
 executor, a disassembler, and a flat-memory bus.
 
+- [Documentation](https://tonic-box.github.io/libtb32/)
+
 ## Build / test
 
 ```
