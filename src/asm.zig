@@ -325,13 +325,16 @@ const Assembler = struct {
     const Enc = struct { w: [2]u32, n: u8 };
 
     fn encode(self: *Assembler, mnem: []const u8, args: [][]const u8, addr: u32) Error!Enc {
-        if (std.mem.eql(u8, mnem, "nop")) return .{ .w = .{ isa.encR(isa.ADD, 0, 0, 0), 0 }, .n = 1 };
+        if (std.mem.eql(u8, mnem, "nop")) {
+            if (args.len != 0) return error.BadArgs;
+            return .{ .w = .{ isa.encR(isa.ADD, 0, 0, 0), 0 }, .n = 1 };
+        }
         if (std.mem.eql(u8, mnem, "mov")) {
-            if (args.len < 2) return error.BadArgs;
+            if (args.len != 2) return error.BadArgs;
             return .{ .w = .{ isa.encR(isa.ADD, try parseReg(args[0]), try parseReg(args[1]), 0), 0 }, .n = 1 };
         }
         if (std.mem.eql(u8, mnem, "li")) {
-            if (args.len < 2) return error.BadArgs;
+            if (args.len != 2) return error.BadArgs;
             const rd = try parseReg(args[0]);
             const imm = mask32(try self.evalImm(args[1], false));
             return .{ .w = .{
@@ -340,6 +343,7 @@ const Assembler = struct {
             }, .n = 2 };
         }
         if (std.mem.eql(u8, mnem, "push")) {
+            if (args.len != 1) return error.BadArgs;
             const r = try parseReg(args[0]);
             return .{ .w = .{
                 isa.encI(isa.ADDI, 13, 13, @truncate(mask32(-4) & 0xFFFF)),
@@ -347,6 +351,7 @@ const Assembler = struct {
             }, .n = 2 };
         }
         if (std.mem.eql(u8, mnem, "pop")) {
+            if (args.len != 1) return error.BadArgs;
             const r = try parseReg(args[0]);
             return .{ .w = .{
                 isa.encI(isa.LW, r, 13, 0),
@@ -354,6 +359,7 @@ const Assembler = struct {
             }, .n = 2 };
         }
         if (std.mem.eql(u8, mnem, "j")) {
+            if (args.len != 1) return error.BadArgs;
             const off = (try self.evalImm(args[0], false)) - @as(i64, addr);
             return .{ .w = .{ isa.encJ(isa.BRA, @intCast(@as(u64, @bitCast(off >> 2)) & 0x1FFFFFF)), 0 }, .n = 1 };
         }
@@ -363,32 +369,42 @@ const Assembler = struct {
         switch (info.fmt) {
             .r => {
                 if (std.mem.eql(u8, mnem, "cmp") or std.mem.eql(u8, mnem, "tst")) {
+                    if (args.len != 2) return error.BadArgs;
                     return .{ .w = .{ isa.encR(op, 0, try parseReg(args[0]), try parseReg(args[1])), 0 }, .n = 1 };
                 }
-                if (args.len < 3) return error.BadArgs;
+                if (args.len != 3) return error.BadArgs;
                 return .{ .w = .{ isa.encR(op, try parseReg(args[0]), try parseReg(args[1]), try parseReg(args[2])), 0 }, .n = 1 };
             },
             .i => {
-                if (std.mem.eql(u8, mnem, "lui")) {
-                    return .{ .w = .{ isa.encI(op, try parseReg(args[0]), 0, @truncate(mask32(try self.evalImm(args[1], false)) & 0xFFFF)), 0 }, .n = 1 };
-                }
-                if (std.mem.eql(u8, mnem, "cmpi")) {
+                if (std.mem.eql(u8, mnem, "lui") or std.mem.eql(u8, mnem, "cmpi")) {
+                    if (args.len != 2) return error.BadArgs;
+                    if (std.mem.eql(u8, mnem, "lui")) {
+                        return .{ .w = .{ isa.encI(op, try parseReg(args[0]), 0, @truncate(mask32(try self.evalImm(args[1], false)) & 0xFFFF)), 0 }, .n = 1 };
+                    }
                     return .{ .w = .{ isa.encI(op, 0, try parseReg(args[0]), @truncate(mask32(try self.evalImm(args[1], false)) & 0xFFFF)), 0 }, .n = 1 };
                 }
-                if (args.len < 3) return error.BadArgs;
+                if (args.len != 3) return error.BadArgs;
                 return .{ .w = .{ isa.encI(op, try parseReg(args[0]), try parseReg(args[1]), @truncate(mask32(try self.evalImm(args[2], false)) & 0xFFFF)), 0 }, .n = 1 };
             },
             .ld, .st => {
+                if (args.len != 2) return error.BadArgs;
                 const rd = try parseReg(args[0]);
                 const m = try parseMem(self, args[1]);
                 return .{ .w = .{ isa.encI(op, rd, m.base, @truncate(mask32(m.imm) & 0xFFFF)), 0 }, .n = 1 };
             },
             .j => {
+                if (args.len != 1) return error.BadArgs;
                 const off = (try self.evalImm(args[0], false)) - @as(i64, addr);
                 return .{ .w = .{ isa.encJ(op, @intCast(@as(u64, @bitCast(off >> 2)) & 0x1FFFFFF)), 0 }, .n = 1 };
             },
-            .reg => return .{ .w = .{ isa.encReg(op, try parseReg(args[0])), 0 }, .n = 1 },
-            .non => return .{ .w = .{ @as(u32, op) << 25, 0 }, .n = 1 },
+            .reg => {
+                if (args.len != 1) return error.BadArgs;
+                return .{ .w = .{ isa.encReg(op, try parseReg(args[0])), 0 }, .n = 1 };
+            },
+            .non => {
+                if (args.len != 0) return error.BadArgs;
+                return .{ .w = .{ @as(u32, op) << 25, 0 }, .n = 1 };
+            },
         }
     }
 
@@ -718,4 +734,17 @@ test "reports a line-anchored diagnostic on error" {
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.UnknownInstruction, assembleDiag(gpa, src, &diag));
     try std.testing.expectEqual(@as(u32, 3), diag.line);
+}
+
+test "rejects too many operands" {
+    const gpa = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.BadArgs, assembleDiag(gpa, ".text\nli r2, 37, 1\n", &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+}
+
+test "rejects too few operands" {
+    const gpa = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.BadArgs, assembleDiag(gpa, ".text\nadd r1, r2\n", &diag));
 }
