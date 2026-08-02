@@ -5,6 +5,7 @@ architecture. It provides the ISA (encode/decode), an assembler, a host-agnostic
 executor, a disassembler, and a flat-memory bus.
 
 - [Documentation](https://tonic-box.github.io/libtb32/)
+- Powers TonicBoxOS (WASM) hosted at [tonicbox.dev](https://tonicbox.dev/) 
 
 ## Build / test
 
