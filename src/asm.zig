@@ -94,12 +94,20 @@ const Pending = struct {
     kind: PKind,
     sec: usize,
     off: u32,
+    line: u32 = 0,
     name: []const u8 = "",
     n: u32 = 0,
     items: [][]const u8 = &.{},
     data: []const u8 = "",
     mnem: []const u8 = "",
     args: [][]const u8 = &.{},
+};
+
+/// A source location and human-readable reason for an assembly failure. `line` is
+/// 1-based; 0 means the location is unknown.
+pub const Diagnostic = struct {
+    line: u32 = 0,
+    message: []const u8 = "",
 };
 
 const Reloc = struct { vaddr: u32, typ: u32, addend: u32 };
@@ -112,6 +120,7 @@ const Assembler = struct {
     sections: [4]std.ArrayList(u8),
     sec_base: [4]u32,
     cur: usize,
+    cur_line: u32,
     entry_label: []const u8,
     relocs: std.ArrayList(Reloc),
     pending: std.ArrayList(Pending),
@@ -125,6 +134,7 @@ const Assembler = struct {
             .sections = undefined,
             .sec_base = .{ 0, 0, 0, 0 },
             .cur = 0,
+            .cur_line = 0,
             .entry_label = "_start",
             .relocs = std.ArrayList(Reloc).init(a),
             .pending = std.ArrayList(Pending).init(a),
@@ -167,15 +177,18 @@ const Assembler = struct {
 
     fn layout(self: *Assembler, src: []const u8) Error!void {
         var loc = [_]u32{ 0, 0, 0, 0 };
+        var lineno: u32 = 0;
         var it = std.mem.splitScalar(u8, src, '\n');
         while (it.next()) |raw_line| {
+            lineno += 1;
+            self.cur_line = lineno;
             var line = stripComment(raw_line);
             line = std.mem.trim(u8, line, " \t\r\n");
             if (line.len == 0) continue;
             while (line.len > 0) {
                 const colon = labelPrefix(line) orelse break;
                 const name = line[0..colon];
-                try self.pending.append(.{ .kind = .label, .sec = self.cur, .off = loc[self.cur], .name = name });
+                try self.pending.append(.{ .kind = .label, .sec = self.cur, .off = loc[self.cur], .line = lineno, .name = name });
                 line = std.mem.trim(u8, line[colon + 1 ..], " \t\r\n");
             }
             if (line.len == 0) continue;
@@ -189,7 +202,7 @@ const Assembler = struct {
                 const mnem = try lowerDup(self.a, if (sp) |p| line[0..p] else line);
                 const argstr = if (sp) |p| std.mem.trim(u8, line[p..], " \t\r\n") else "";
                 const args = try splitArgs(self.a, argstr);
-                try self.pending.append(.{ .kind = .insn, .sec = self.cur, .off = loc[self.cur], .mnem = mnem, .args = args });
+                try self.pending.append(.{ .kind = .insn, .sec = self.cur, .off = loc[self.cur], .line = lineno, .mnem = mnem, .args = args });
                 loc[self.cur] += sizeOf(mnem);
             }
         }
@@ -229,19 +242,19 @@ const Assembler = struct {
             const n = std.fmt.parseInt(u32, std.mem.trim(u8, rest, " \t\r\n"), 0) catch return error.BadArgs;
             const cur = loc[self.cur];
             const pad = if (n == 0) 0 else (n - (cur % n)) % n;
-            try self.pending.append(.{ .kind = .space, .sec = self.cur, .off = cur, .n = pad });
+            try self.pending.append(.{ .kind = .space, .sec = self.cur, .off = cur, .line = self.cur_line, .n = pad });
             loc[self.cur] += pad;
             return;
         }
         if (std.mem.eql(u8, d, ".word")) {
             const items = try splitArgs(self.a, rest);
-            try self.pending.append(.{ .kind = .word, .sec = self.cur, .off = loc[self.cur], .items = items });
+            try self.pending.append(.{ .kind = .word, .sec = self.cur, .off = loc[self.cur], .line = self.cur_line, .items = items });
             loc[self.cur] += 4 * @as(u32, @intCast(items.len));
             return;
         }
         if (std.mem.eql(u8, d, ".byte")) {
             const items = try splitArgs(self.a, rest);
-            try self.pending.append(.{ .kind = .byte, .sec = self.cur, .off = loc[self.cur], .items = items });
+            try self.pending.append(.{ .kind = .byte, .sec = self.cur, .off = loc[self.cur], .line = self.cur_line, .items = items });
             loc[self.cur] += @intCast(items.len);
             return;
         }
@@ -255,13 +268,13 @@ const Assembler = struct {
                 nd[data.len] = 0;
                 data = nd;
             }
-            try self.pending.append(.{ .kind = .raw, .sec = self.cur, .off = loc[self.cur], .data = data });
+            try self.pending.append(.{ .kind = .raw, .sec = self.cur, .off = loc[self.cur], .line = self.cur_line, .data = data });
             loc[self.cur] += @intCast(data.len);
             return;
         }
         if (std.mem.eql(u8, d, ".space") or std.mem.eql(u8, d, ".skip")) {
             const n = std.fmt.parseInt(u32, std.mem.trim(u8, rest, " \t\r\n"), 0) catch return error.BadArgs;
-            try self.pending.append(.{ .kind = .space, .sec = self.cur, .off = loc[self.cur], .n = n });
+            try self.pending.append(.{ .kind = .space, .sec = self.cur, .off = loc[self.cur], .line = self.cur_line, .n = n });
             loc[self.cur] += n;
             return;
         }
@@ -274,6 +287,7 @@ const Assembler = struct {
 
     fn emit(self: *Assembler) Error!void {
         for (self.pending.items) |p| {
+            self.cur_line = p.line;
             var buf = &self.sections[p.sec];
             while (buf.items.len < p.off) try buf.append(0);
             switch (p.kind) {
@@ -652,14 +666,40 @@ fn hexVal(c: u8) u8 {
     return c - 'A' + 10;
 }
 
+fn messageFor(e: Error) []const u8 {
+    return switch (e) {
+        error.BadRegister => "invalid register",
+        error.BadMemoryOperand => "invalid memory operand",
+        error.BadString => "invalid string literal",
+        error.UnknownInstruction => "unknown instruction",
+        error.UnknownDirective => "unknown directive",
+        error.UnresolvedSymbol => "unresolved symbol",
+        error.CannotEvaluate => "cannot evaluate expression",
+        error.BadArgs => "wrong number or form of operands",
+        error.OutOfMemory => "out of memory",
+    };
+}
+
 /// Assembles TB32 source into a TBX object. Caller owns the returned bytes; free with `gpa.free`.
 pub fn assemble(gpa: std.mem.Allocator, src: []const u8) Error![]u8 {
+    var diag: Diagnostic = .{};
+    return assembleDiag(gpa, src, &diag);
+}
+
+/// Assembles TB32 source into a TBX object, filling `diag` with the source line and reason
+/// on failure. Caller owns the returned bytes; free with `gpa.free`.
+pub fn assembleDiag(gpa: std.mem.Allocator, src: []const u8, diag: *Diagnostic) Error![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var asm_ = Assembler.init(arena.allocator());
-    try asm_.layout(src);
-    try asm_.emit();
-    return asm_.buildTbx(gpa);
+    asm_.layout(src) catch |e| return fail(e, &asm_, diag);
+    asm_.emit() catch |e| return fail(e, &asm_, diag);
+    return asm_.buildTbx(gpa) catch |e| return fail(e, &asm_, diag);
+}
+
+fn fail(e: Error, asm_: *Assembler, diag: *Diagnostic) Error {
+    diag.* = .{ .line = asm_.cur_line, .message = messageFor(e) };
+    return e;
 }
 
 test "assembles and round-trips a small program" {
@@ -670,4 +710,12 @@ test "assembles and round-trips a small program" {
     defer gpa.free(tbx);
     try std.testing.expect(tbx.len > 32);
     try std.testing.expectEqualSlices(u8, "TBX\x7f", tbx[0..4]);
+}
+
+test "reports a line-anchored diagnostic on error" {
+    const gpa = std.testing.allocator;
+    const src = ".text\n_start:\n    bogusinstr r1, r2\n    hlt\n";
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.UnknownInstruction, assembleDiag(gpa, src, &diag));
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
 }

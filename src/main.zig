@@ -30,7 +30,11 @@ pub fn main() !void {
     const src = try std.fs.cwd().readFileAlloc(a, inp.?, 64 * 1024 * 1024);
     defer a.free(src);
 
-    const tbx = try tb32.assemble(a, src);
+    var diag: tb32.Diagnostic = .{};
+    const tbx = tb32.assembleDiag(a, src, &diag) catch {
+        std.debug.print("{s}:{d}: error: {s}\n", .{ inp.?, diag.line, diag.message });
+        std.process.exit(1);
+    };
     defer a.free(tbx);
 
     if (outp) |o| {

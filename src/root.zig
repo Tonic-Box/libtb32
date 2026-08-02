@@ -19,6 +19,8 @@ pub const FlatBus = @import("flatbus.zig").FlatBus;
 
 pub const assembler = @import("asm.zig");
 pub const assemble = assembler.assemble;
+pub const assembleDiag = assembler.assembleDiag;
+pub const Diagnostic = assembler.Diagnostic;
 
 test {
     _ = isa;
