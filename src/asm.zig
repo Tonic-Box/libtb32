@@ -110,6 +110,9 @@ pub const Diagnostic = struct {
     message: []const u8 = "",
 };
 
+/// Maps an emitted instruction word's virtual address to its 1-based source line.
+pub const LineEntry = struct { addr: u32, line: u32 };
+
 const Reloc = struct { vaddr: u32, typ: u32, addend: u32 };
 const LabelEntry = struct { name: []const u8, value: i64 };
 
@@ -125,6 +128,7 @@ const Assembler = struct {
     relocs: std.ArrayList(Reloc),
     pending: std.ArrayList(Pending),
     label_order: std.ArrayList(LabelEntry),
+    lines: ?*std.ArrayList(LineEntry) = null,
 
     fn init(a: std.mem.Allocator) Assembler {
         var self: Assembler = .{
@@ -316,7 +320,10 @@ const Assembler = struct {
                     }
                     const enc = try self.encode(p.mnem, p.args, addr);
                     var k: usize = 0;
-                    while (k < enc.n) : (k += 1) try appendLE32(buf, enc.w[k]);
+                    while (k < enc.n) : (k += 1) {
+                        if (self.lines) |list| try list.append(.{ .addr = addr + @as(u32, @intCast(k)) * 4, .line = p.line });
+                        try appendLE32(buf, enc.w[k]);
+                    }
                 },
             }
         }
@@ -713,6 +720,18 @@ pub fn assembleDiag(gpa: std.mem.Allocator, src: []const u8, diag: *Diagnostic) 
     return asm_.buildTbx(gpa) catch |e| return fail(e, &asm_, diag);
 }
 
+/// Like `assembleDiag`, but also appends an address-to-source-line entry for every emitted
+/// instruction word to `lines` (caller owns it).
+pub fn assembleDebug(gpa: std.mem.Allocator, src: []const u8, diag: *Diagnostic, lines: *std.ArrayList(LineEntry)) Error![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var asm_ = Assembler.init(arena.allocator());
+    asm_.lines = lines;
+    asm_.layout(src) catch |e| return fail(e, &asm_, diag);
+    asm_.emit() catch |e| return fail(e, &asm_, diag);
+    return asm_.buildTbx(gpa) catch |e| return fail(e, &asm_, diag);
+}
+
 fn fail(e: Error, asm_: *Assembler, diag: *Diagnostic) Error {
     diag.* = .{ .line = asm_.cur_line, .message = messageFor(e) };
     return e;
@@ -726,6 +745,18 @@ test "assembles and round-trips a small program" {
     defer gpa.free(tbx);
     try std.testing.expect(tbx.len > 32);
     try std.testing.expectEqualSlices(u8, "TBX\x7f", tbx[0..4]);
+}
+
+test "assembleDebug records an address-to-line map" {
+    const gpa = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    var lines = std.ArrayList(LineEntry).init(gpa);
+    defer lines.deinit();
+    const tbx = try assembleDebug(gpa, ".text\n_start:\nadd r1, r2, r3\nhlt\n", &diag, &lines);
+    defer gpa.free(tbx);
+    try std.testing.expect(lines.items.len >= 2);
+    try std.testing.expectEqual(@as(u32, 0x1000), lines.items[0].addr);
+    try std.testing.expectEqual(@as(u32, 3), lines.items[0].line);
 }
 
 test "reports a line-anchored diagnostic on error" {
