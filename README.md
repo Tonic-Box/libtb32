@@ -2,7 +2,8 @@
 
 A small, standalone core for the **TB32** instruction set, a fixed-width 32-bit RISC 
 architecture. It provides the ISA (encode/decode), an assembler, a host-agnostic CPU 
-executor, a disassembler, and a flat-memory bus.
+executor, a disassembler, a flat-memory bus, and an optional privileged extension 
+(**TB32-V**) for virtualization.
 
 - [Documentation](https://tonic-box.github.io/libtb32/)
 - Powers TonicBoxOS (WASM) hosted at [tonicbox.dev](https://tonicbox.dev/) 
@@ -39,6 +40,16 @@ while (true) switch (tb32.step(&cpu, &bus)) {
     .fault => reportFault(cpu.trap, cpu.insn_pc),
 };
 ```
+
+## Virtualization (TB32-V)
+
+Beyond the unprivileged core, libtb32 implements an optional privileged extension that makes TB32
+virtualizable - privilege modes (user / supervisor / hypervisor with a virtualization bit),
+control/status registers, in-CPU traps with delegation, two-stage (nested) address translation,
+and timers, modeled on the RISC-V hypervisor extension. A `Hart` (base CPU plus mode and CSR
+banks) runs under `stepV` against a physical-memory bus. It is what the
+[tb32hv](https://github.com/Tonic-Box/tb32hv) hypervisor is built on; the base `step` path is
+untouched, so existing consumers are unaffected.
 
 ## License
 [MIT](LICENSE)
