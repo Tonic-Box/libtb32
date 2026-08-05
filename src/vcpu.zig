@@ -35,12 +35,23 @@ pub const CAUSE_FETCH_GUEST_FAULT: u32 = 20;
 pub const CAUSE_LOAD_GUEST_FAULT: u32 = 21;
 pub const CAUSE_STORE_GUEST_FAULT: u32 = 23;
 
+/// Set in a cause word to mark it an interrupt rather than an exception.
+pub const INT_FLAG: u32 = 0x80000000;
+pub const CAUSE_INT_TIMER: u32 = INT_FLAG | 5;
+pub const CAUSE_INT_EXTERNAL: u32 = INT_FLAG | 9;
+
+const IRQ_TIMER: u32 = 1 << 5;
+const IRQ_EXTERNAL: u32 = 1 << 9;
+
 pub const CSR_SSTATUS: u16 = 0x100;
 pub const CSR_STVEC: u16 = 0x105;
 pub const CSR_SSCRATCH: u16 = 0x140;
 pub const CSR_SEPC: u16 = 0x141;
+pub const CSR_SIE: u16 = 0x104;
 pub const CSR_SCAUSE: u16 = 0x142;
 pub const CSR_STVAL: u16 = 0x143;
+pub const CSR_SIP: u16 = 0x144;
+pub const CSR_STIMECMP: u16 = 0x14D;
 pub const CSR_SATP: u16 = 0x180;
 
 pub const CSR_HSTATUS: u16 = 0x600;
@@ -50,6 +61,7 @@ pub const CSR_HSCRATCH: u16 = 0x640;
 pub const CSR_HEPC: u16 = 0x641;
 pub const CSR_HCAUSE: u16 = 0x642;
 pub const CSR_HTVAL: u16 = 0x643;
+pub const CSR_HTINST: u16 = 0x64A;
 pub const CSR_HGATP: u16 = 0x680;
 
 const SSTATUS_SIE: u32 = 1 << 1;
@@ -74,6 +86,9 @@ pub const Csr = struct {
     stval: u32 = 0,
     sscratch: u32 = 0,
     satp: u32 = 0,
+    sie_mask: u32 = 0,
+    sip: u32 = 0,
+    stimecmp: u32 = 0,
     sie: bool = false,
     spie: bool = false,
     spp: Mode = .user,
@@ -89,6 +104,7 @@ pub const Hcsr = struct {
     hscratch: u32 = 0,
     hedeleg: u32 = 0,
     hgatp: u32 = 0,
+    htinst: u32 = 0,
     hpp: Mode = .supervisor,
     spv: bool = false,
 };
@@ -104,6 +120,7 @@ pub const Hart = struct {
     mmu_fault: bool = false,
     mmu_cause: u32 = 0,
     mmu_tval: u32 = 0,
+    time: u32 = 0,
 };
 
 fn atLeast(mode: Mode, need: Mode) bool {
@@ -164,6 +181,32 @@ fn causeOf(code: u32) u32 {
         base.FAULT_DIV0 => CAUSE_DIV0,
         else => CAUSE_ILLEGAL,
     };
+}
+
+/// Returns the cause of a pending, enabled supervisor interrupt for the running guest, or null.
+/// Interrupts target the guest supervisor and are taken in guest user mode, or in guest
+/// supervisor mode when its global interrupt-enable is set.
+fn pendingInterrupt(h: *Hart) ?u32 {
+    if (!h.v) return null;
+    const active = h.csr.sip & h.csr.sie_mask;
+    if (active == 0) return null;
+    if (h.mode == .supervisor and !h.csr.sie) return null;
+    if (active & IRQ_EXTERNAL != 0) return CAUSE_INT_EXTERNAL;
+    if (active & IRQ_TIMER != 0) return CAUSE_INT_TIMER;
+    return null;
+}
+
+/// Delivers an interrupt to the guest supervisor, saving the interrupted state so the current
+/// instruction re-executes after the handler returns.
+fn takeInterrupt(h: *Hart, cause: u32) void {
+    h.csr.scause = cause;
+    h.csr.sepc = h.cpu.pc;
+    h.csr.stval = 0;
+    h.csr.spp = h.mode;
+    h.csr.spie = h.csr.sie;
+    h.csr.sie = false;
+    h.mode = .supervisor;
+    h.cpu.pc = h.csr.stvec;
 }
 
 fn setFault(h: *Hart, cause: u32, tval: u32) void {
@@ -313,6 +356,9 @@ fn csrRead(h: *Hart, csr: u16) ?u32 {
         CSR_SCAUSE => h.csr.scause,
         CSR_STVAL => h.csr.stval,
         CSR_SATP => h.csr.satp,
+        CSR_SIE => h.csr.sie_mask,
+        CSR_SIP => h.csr.sip,
+        CSR_STIMECMP => h.csr.stimecmp,
         CSR_HSTATUS => (if (h.hcsr.spv) HSTATUS_SPV else 0) | (@as(u32, @intFromEnum(h.hcsr.hpp)) << 1),
         CSR_HEDELEG => h.hcsr.hedeleg,
         CSR_HTVEC => h.hcsr.htvec,
@@ -320,6 +366,7 @@ fn csrRead(h: *Hart, csr: u16) ?u32 {
         CSR_HEPC => h.hcsr.hepc,
         CSR_HCAUSE => h.hcsr.hcause,
         CSR_HTVAL => h.hcsr.htval,
+        CSR_HTINST => h.hcsr.htinst,
         CSR_HGATP => h.hcsr.hgatp,
         else => null,
     };
@@ -338,6 +385,9 @@ fn csrWrite(h: *Hart, csr: u16, v: u32) bool {
         CSR_SCAUSE => h.csr.scause = v,
         CSR_STVAL => h.csr.stval = v,
         CSR_SATP => h.csr.satp = v,
+        CSR_SIE => h.csr.sie_mask = v,
+        CSR_SIP => h.csr.sip = v,
+        CSR_STIMECMP => h.csr.stimecmp = v,
         CSR_HSTATUS => {
             h.hcsr.spv = (v & HSTATUS_SPV) != 0;
             const pp: u32 = (v >> 1) & 3;
@@ -349,6 +399,7 @@ fn csrWrite(h: *Hart, csr: u16, v: u32) bool {
         CSR_HEPC => h.hcsr.hepc = v,
         CSR_HCAUSE => h.hcsr.hcause = v,
         CSR_HTVAL => h.hcsr.htval = v,
+        CSR_HTINST => h.hcsr.htinst = v,
         CSR_HGATP => h.hcsr.hgatp = v,
         else => return false,
     }
@@ -364,6 +415,11 @@ fn setReg(h: *Hart, rd: u4, v: u32) void {
 /// faults become traps routed by delegation.
 pub fn stepV(h: *Hart, bus: anytype) VStop {
     const cpu = &h.cpu;
+    if (h.csr.stimecmp != 0 and h.time >= h.csr.stimecmp) h.csr.sip |= IRQ_TIMER;
+    if (pendingInterrupt(h)) |icause| {
+        takeInterrupt(h, icause);
+        return .ok;
+    }
     if (cpu.pc & 3 != 0) {
         trap(h, CAUSE_MISALIGN, cpu.pc, cpu.pc);
         return .ok;
@@ -440,6 +496,7 @@ pub fn stepV(h: *Hart, bus: anytype) VStop {
                 },
                 .fault => {
                     if (h.mmu_fault) {
+                        if (isGuestPageFault(h.mmu_cause)) h.hcsr.htinst = word;
                         trap(h, h.mmu_cause, ipc, h.mmu_tval);
                     } else {
                         trap(h, causeOf(cpu.trap), ipc, 0);
@@ -722,4 +779,93 @@ test "an unmapped guest-physical store faults to the hypervisor" {
     try std.testing.expectEqual(CAUSE_STORE_GUEST_FAULT, h.cpu.r[6]);
     try std.testing.expectEqual(Mode.hypervisor, h.mode);
     try std.testing.expect(!h.v);
+}
+
+test "guest takes an injected external interrupt and returns" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    var ram = [_]u8{0} ** 512;
+    var bus = FlatBus{ .ram = &ram };
+
+    put(&ram, 0x00, @as(u32, isa.HLT) << 25);
+    put(&ram, 0x40, isa.encI(isa.CSRR, 3, 0, CSR_SCAUSE));
+    put(&ram, 0x44, isa.encI(isa.CSRW, 0, 0, CSR_SIP));
+    put(&ram, 0x48, isa.encI(isa.ORI, 5, 0, 0xCC));
+    put(&ram, 0x4C, @as(u32, isa.SRET) << 25);
+
+    var h = Hart{ .mode = .supervisor, .v = true };
+    h.csr.stvec = 0x40;
+    h.csr.sie = true;
+    h.csr.sie_mask = IRQ_EXTERNAL;
+    h.csr.sip = IRQ_EXTERNAL;
+    h.cpu.pc = 0;
+    try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
+    try std.testing.expectEqual(CAUSE_INT_EXTERNAL, h.cpu.r[3]);
+    try std.testing.expectEqual(@as(u32, 0xCC), h.cpu.r[5]);
+    try std.testing.expectEqual(@as(u32, 0), h.csr.sip);
+    try std.testing.expect(h.v);
+}
+
+test "guest timer interrupt fires when time reaches the compare" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    var ram = [_]u8{0} ** 512;
+    var bus = FlatBus{ .ram = &ram };
+
+    put(&ram, 0x00, @as(u32, isa.HLT) << 25);
+    put(&ram, 0x40, isa.encI(isa.CSRR, 3, 0, CSR_SCAUSE));
+    put(&ram, 0x44, isa.encI(isa.CSRW, 0, 0, CSR_STIMECMP));
+    put(&ram, 0x48, isa.encI(isa.CSRW, 0, 0, CSR_SIP));
+    put(&ram, 0x4C, isa.encI(isa.ORI, 5, 0, 0xDD));
+    put(&ram, 0x50, @as(u32, isa.SRET) << 25);
+
+    var h = Hart{ .mode = .supervisor, .v = true };
+    h.csr.stvec = 0x40;
+    h.csr.sie = true;
+    h.csr.sie_mask = 1 << 5;
+    h.csr.stimecmp = 5;
+    h.time = 10;
+    h.cpu.pc = 0;
+    try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
+    try std.testing.expectEqual(CAUSE_INT_TIMER, h.cpu.r[3]);
+    try std.testing.expectEqual(@as(u32, 0xDD), h.cpu.r[5]);
+}
+
+test "hypervisor injects a guest interrupt by writing sip from H mode" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    var ram = [_]u8{0} ** 256;
+    var bus = FlatBus{ .ram = &ram };
+
+    put(&ram, 0x00, isa.encI(isa.ORI, 1, 0, 1 << 9));
+    put(&ram, 0x04, isa.encI(isa.CSRW, 0, 1, CSR_SIP));
+    put(&ram, 0x08, @as(u32, isa.HLT) << 25);
+
+    var h = Hart{ .mode = .hypervisor };
+    h.cpu.pc = 0;
+    try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
+    try std.testing.expectEqual(@as(u32, 1 << 9), h.csr.sip);
+}
+
+test "hypervisor records the trapping instruction on a guest MMIO fault" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    const ram = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(ram);
+    @memset(ram, 0);
+    var bus = FlatBus{ .ram = ram };
+
+    put(ram, 0x40, isa.encI(isa.CSRR, 6, 0, CSR_HTINST));
+    put(ram, 0x44, @as(u32, isa.HLT) << 25);
+
+    const store_word = isa.encI(isa.SW, 2, 2, 0);
+    put(ram, 0x2000, isa.encI(isa.ORI, 2, 0, 0x6000));
+    put(ram, 0x2004, store_word);
+    put(ram, 0x2008, @as(u32, isa.HLT) << 25);
+
+    var nf: u32 = 16;
+    ptMap(ram, 1 << 12, 0x2000, 0x2000, PTE_R | PTE_X, &nf);
+
+    var h = Hart{ .mode = .supervisor, .v = true };
+    h.hcsr.hgatp = (1 << 31) | 1;
+    h.hcsr.htvec = 0x40;
+    h.cpu.pc = 0x2000;
+    try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
+    try std.testing.expectEqual(store_word, h.cpu.r[6]);
 }
