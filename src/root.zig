@@ -22,6 +22,7 @@ pub const Mode = vcpu.Mode;
 pub const Csr = vcpu.Csr;
 pub const Hcsr = vcpu.Hcsr;
 pub const VStop = vcpu.VStop;
+pub const AccessKind = vcpu.AccessKind;
 pub const stepV = vcpu.stepV;
 
 pub const disasm = @import("disasm.zig").disasm;
