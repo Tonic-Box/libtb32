@@ -412,6 +412,14 @@ const Assembler = struct {
                 if (args.len != 0) return error.BadArgs;
                 return .{ .w = .{ @as(u32, op) << 25, 0 }, .n = 1 };
             },
+            .csr_r => {
+                if (args.len != 2) return error.BadArgs;
+                return .{ .w = .{ isa.encI(op, try parseReg(args[0]), 0, @truncate(mask32(try self.evalImm(args[1], false)) & 0xFFFF)), 0 }, .n = 1 };
+            },
+            .csr_w => {
+                if (args.len != 2) return error.BadArgs;
+                return .{ .w = .{ isa.encI(op, 0, try parseReg(args[1]), @truncate(mask32(try self.evalImm(args[0], false)) & 0xFFFF)), 0 }, .n = 1 };
+            },
         }
     }
 
@@ -745,6 +753,14 @@ test "assembles and round-trips a small program" {
     defer gpa.free(tbx);
     try std.testing.expect(tbx.len > 32);
     try std.testing.expectEqualSlices(u8, "TBX\x7f", tbx[0..4]);
+}
+
+test "assembles the privileged instructions" {
+    const gpa = std.testing.allocator;
+    const src = ".text\n_start:\n    csrw 0x680, r1\n    csrr r3, 0x142\n    sret\n    hret\n    hcall\n";
+    const tbx = try assemble(gpa, src);
+    defer gpa.free(tbx);
+    try std.testing.expect(tbx.len > 32);
 }
 
 test "assembleDebug records an address-to-line map" {

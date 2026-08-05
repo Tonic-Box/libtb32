@@ -2,9 +2,9 @@
 
 const std = @import("std");
 
-/// The four TB32 instruction encoding formats. `ld` and `st` are I-form variants
-/// distinguished only by operand syntax.
-pub const Fmt = enum { r, i, ld, st, j, reg, non };
+/// The TB32 instruction encoding formats. `ld` and `st` are I-form variants distinguished only
+/// by operand syntax; `csr_r` and `csr_w` are the control-register read and write forms.
+pub const Fmt = enum { r, i, ld, st, j, reg, non, csr_r, csr_w };
 
 pub const ADD: u7 = 0x10;
 pub const SUB: u7 = 0x11;
@@ -120,6 +120,11 @@ pub const OPS = [_]OpInfo{
     .{ .name = "sys", .code = SYS, .fmt = .non },
     .{ .name = "hlt", .code = HLT, .fmt = .non },
     .{ .name = "brk", .code = BRK, .fmt = .non },
+    .{ .name = "csrr", .code = CSRR, .fmt = .csr_r },
+    .{ .name = "csrw", .code = CSRW, .fmt = .csr_w },
+    .{ .name = "sret", .code = SRET, .fmt = .non },
+    .{ .name = "hret", .code = HRET, .fmt = .non },
+    .{ .name = "hcall", .code = HCALL, .fmt = .non },
 };
 
 /// Looks up a mnemonic's opcode and format; null if unknown.

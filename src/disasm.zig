@@ -36,6 +36,8 @@ pub fn disasm(word: u32, addr: u32, buf: []u8) []const u8 {
         },
         .reg => std.fmt.bufPrint(buf, "{s} {s}", .{ info.name, rs1 }),
         .non => std.fmt.bufPrint(buf, "{s}", .{info.name}),
+        .csr_r => std.fmt.bufPrint(buf, "{s} {s}, 0x{x}", .{ info.name, rd, d.imm16 }),
+        .csr_w => std.fmt.bufPrint(buf, "{s} 0x{x}, {s}", .{ info.name, d.imm16, rs1 }),
     };
     return s catch buf[0..0];
 }
@@ -47,4 +49,8 @@ test "disassembles common forms" {
     try std.testing.expectEqualStrings("lw r1, [r13, 0]", disasm(isa.encI(isa.LW, 1, 13, 0), 0, &buf));
     try std.testing.expectEqualStrings("ret", disasm(@as(u32, isa.RET) << 25, 0, &buf));
     try std.testing.expectEqualStrings("bra 0x1008", disasm(isa.encJ(isa.BRA, (8 >> 2)), 0x1000, &buf));
+    try std.testing.expectEqualStrings("csrr r3, 0x142", disasm(isa.encI(isa.CSRR, 3, 0, 0x142), 0, &buf));
+    try std.testing.expectEqualStrings("csrw 0x680, r1", disasm(isa.encI(isa.CSRW, 0, 1, 0x680), 0, &buf));
+    try std.testing.expectEqualStrings("sret", disasm(@as(u32, isa.SRET) << 25, 0, &buf));
+    try std.testing.expectEqualStrings("hret", disasm(@as(u32, isa.HRET) << 25, 0, &buf));
 }
