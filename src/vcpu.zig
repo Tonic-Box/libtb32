@@ -44,6 +44,7 @@ const IRQ_TIMER: u32 = 1 << 5;
 const IRQ_EXTERNAL: u32 = 1 << 9;
 
 pub const CSR_SSTATUS: u16 = 0x100;
+pub const CSR_SFLAGS: u16 = 0x101;
 pub const CSR_STVEC: u16 = 0x105;
 pub const CSR_SSCRATCH: u16 = 0x140;
 pub const CSR_SEPC: u16 = 0x141;
@@ -365,6 +366,7 @@ fn TransBus(comptime P: type) type {
 fn csrRead(h: *Hart, csr: u16) ?u32 {
     return switch (csr) {
         CSR_SSTATUS => (if (h.csr.sie) SSTATUS_SIE else 0) | (if (h.csr.spie) SSTATUS_SPIE else 0) | (if (h.csr.spp == .supervisor) SSTATUS_SPP else 0),
+        CSR_SFLAGS => (if (h.cpu.f.z) @as(u32, 1) else 0) | (if (h.cpu.f.n) @as(u32, 2) else 0) | (if (h.cpu.f.c) @as(u32, 4) else 0) | (if (h.cpu.f.v) @as(u32, 8) else 0),
         CSR_STVEC => h.csr.stvec,
         CSR_SSCRATCH => h.csr.sscratch,
         CSR_SEPC => h.csr.sepc,
@@ -394,6 +396,12 @@ fn csrWrite(h: *Hart, csr: u16, v: u32) bool {
             h.csr.sie = (v & SSTATUS_SIE) != 0;
             h.csr.spie = (v & SSTATUS_SPIE) != 0;
             h.csr.spp = if ((v & SSTATUS_SPP) != 0) .supervisor else .user;
+        },
+        CSR_SFLAGS => {
+            h.cpu.f.z = (v & 1) != 0;
+            h.cpu.f.n = (v & 2) != 0;
+            h.cpu.f.c = (v & 4) != 0;
+            h.cpu.f.v = (v & 8) != 0;
         },
         CSR_STVEC => h.csr.stvec = v,
         CSR_SSCRATCH => h.csr.sscratch = v,
@@ -909,4 +917,38 @@ test "hypervisor timer preempts a running guest" {
     try std.testing.expectEqual(CAUSE_INT_TIMER, h.cpu.r[3]);
     try std.testing.expectEqual(Mode.hypervisor, h.mode);
     try std.testing.expect(!h.v);
+}
+
+test "the flags CSR reads and writes the condition flags" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    var ram = [_]u8{0} ** 64;
+    var bus = FlatBus{ .ram = &ram };
+
+    put(&ram, 0x00, isa.encI(isa.ORI, 1, 0, 0xF));
+    put(&ram, 0x04, isa.encI(isa.CSRW, 0, 1, CSR_SFLAGS));
+    put(&ram, 0x08, isa.encI(isa.CSRR, 2, 0, CSR_SFLAGS));
+    put(&ram, 0x0C, @as(u32, isa.HLT) << 25);
+
+    var h = Hart{};
+    try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
+    try std.testing.expectEqual(@as(u32, 0xF), h.cpu.r[2]);
+    try std.testing.expect(h.cpu.f.z and h.cpu.f.n and h.cpu.f.c and h.cpu.f.v);
+}
+
+test "flags restored through the CSR drive a conditional branch" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    var ram = [_]u8{0} ** 64;
+    var bus = FlatBus{ .ram = &ram };
+
+    put(&ram, 0x00, isa.encI(isa.ORI, 1, 0, 1));
+    put(&ram, 0x04, isa.encI(isa.CSRW, 0, 1, CSR_SFLAGS));
+    put(&ram, 0x08, isa.encJ(isa.BEQ, 2));
+    put(&ram, 0x0C, isa.encI(isa.ORI, 5, 0, 0x11));
+    put(&ram, 0x10, isa.encI(isa.ORI, 6, 0, 0x22));
+    put(&ram, 0x14, @as(u32, isa.HLT) << 25);
+
+    var h = Hart{};
+    try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
+    try std.testing.expectEqual(@as(u32, 0), h.cpu.r[5]);
+    try std.testing.expectEqual(@as(u32, 0x22), h.cpu.r[6]);
 }
