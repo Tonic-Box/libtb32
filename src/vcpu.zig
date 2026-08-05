@@ -62,6 +62,7 @@ pub const CSR_HEPC: u16 = 0x641;
 pub const CSR_HCAUSE: u16 = 0x642;
 pub const CSR_HTVAL: u16 = 0x643;
 pub const CSR_HTINST: u16 = 0x64A;
+pub const CSR_HTIMECMP: u16 = 0x64D;
 pub const CSR_HGATP: u16 = 0x680;
 
 const SSTATUS_SIE: u32 = 1 << 1;
@@ -105,6 +106,7 @@ pub const Hcsr = struct {
     hedeleg: u32 = 0,
     hgatp: u32 = 0,
     htinst: u32 = 0,
+    htimecmp: u32 = 0,
     hpp: Mode = .supervisor,
     spv: bool = false,
 };
@@ -194,6 +196,19 @@ fn pendingInterrupt(h: *Hart) ?u32 {
     if (active & IRQ_EXTERNAL != 0) return CAUSE_INT_EXTERNAL;
     if (active & IRQ_TIMER != 0) return CAUSE_INT_TIMER;
     return null;
+}
+
+/// Delivers the hypervisor timer interrupt, preempting the running guest into the hypervisor so
+/// the current guest instruction re-executes after `hret`. The guest cannot mask it.
+fn takeHtimer(h: *Hart) void {
+    h.hcsr.hcause = CAUSE_INT_TIMER;
+    h.hcsr.hepc = h.cpu.pc;
+    h.hcsr.htval = 0;
+    h.hcsr.hpp = h.mode;
+    h.hcsr.spv = h.v;
+    h.mode = .hypervisor;
+    h.v = false;
+    h.cpu.pc = h.hcsr.htvec;
 }
 
 /// Delivers an interrupt to the guest supervisor, saving the interrupted state so the current
@@ -367,6 +382,7 @@ fn csrRead(h: *Hart, csr: u16) ?u32 {
         CSR_HCAUSE => h.hcsr.hcause,
         CSR_HTVAL => h.hcsr.htval,
         CSR_HTINST => h.hcsr.htinst,
+        CSR_HTIMECMP => h.hcsr.htimecmp,
         CSR_HGATP => h.hcsr.hgatp,
         else => null,
     };
@@ -400,6 +416,7 @@ fn csrWrite(h: *Hart, csr: u16, v: u32) bool {
         CSR_HCAUSE => h.hcsr.hcause = v,
         CSR_HTVAL => h.hcsr.htval = v,
         CSR_HTINST => h.hcsr.htinst = v,
+        CSR_HTIMECMP => h.hcsr.htimecmp = v,
         CSR_HGATP => h.hcsr.hgatp = v,
         else => return false,
     }
@@ -415,6 +432,10 @@ fn setReg(h: *Hart, rd: u4, v: u32) void {
 /// faults become traps routed by delegation.
 pub fn stepV(h: *Hart, bus: anytype) VStop {
     const cpu = &h.cpu;
+    if (h.v and h.hcsr.htimecmp != 0 and h.time >= h.hcsr.htimecmp) {
+        takeHtimer(h);
+        return .ok;
+    }
     if (h.csr.stimecmp != 0 and h.time >= h.csr.stimecmp) h.csr.sip |= IRQ_TIMER;
     if (pendingInterrupt(h)) |icause| {
         takeInterrupt(h, icause);
@@ -868,4 +889,24 @@ test "hypervisor records the trapping instruction on a guest MMIO fault" {
     h.cpu.pc = 0x2000;
     try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
     try std.testing.expectEqual(store_word, h.cpu.r[6]);
+}
+
+test "hypervisor timer preempts a running guest" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    var ram = [_]u8{0} ** 256;
+    var bus = FlatBus{ .ram = &ram };
+
+    put(&ram, 0x00, isa.encJ(isa.BRA, 0));
+    put(&ram, 0x40, isa.encI(isa.CSRR, 3, 0, CSR_HCAUSE));
+    put(&ram, 0x44, @as(u32, isa.HLT) << 25);
+
+    var h = Hart{ .mode = .supervisor, .v = true };
+    h.hcsr.htvec = 0x40;
+    h.hcsr.htimecmp = 5;
+    h.time = 10;
+    h.cpu.pc = 0;
+    try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
+    try std.testing.expectEqual(CAUSE_INT_TIMER, h.cpu.r[3]);
+    try std.testing.expectEqual(Mode.hypervisor, h.mode);
+    try std.testing.expect(!h.v);
 }
