@@ -56,6 +56,11 @@ pub const JMP: u7 = 0x4B;
 pub const SYS: u7 = 0x50;
 pub const HLT: u7 = 0x51;
 pub const BRK: u7 = 0x52;
+pub const CSRR: u7 = 0x53;
+pub const CSRW: u7 = 0x54;
+pub const SRET: u7 = 0x55;
+pub const HRET: u7 = 0x56;
+pub const HCALL: u7 = 0x57;
 
 /// Link-time base address of the `.text` section.
 pub const TEXT_BASE: u32 = 0x1000;

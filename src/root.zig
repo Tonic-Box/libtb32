@@ -14,6 +14,15 @@ pub const FAULT_MEM = cpu.FAULT_MEM;
 pub const FAULT_OPCODE = cpu.FAULT_OPCODE;
 pub const FAULT_DIV0 = cpu.FAULT_DIV0;
 
+pub const execOne = cpu.execOne;
+
+const vcpu = @import("vcpu.zig");
+pub const Hart = vcpu.Hart;
+pub const Mode = vcpu.Mode;
+pub const Csr = vcpu.Csr;
+pub const VStop = vcpu.VStop;
+pub const stepV = vcpu.stepV;
+
 pub const disasm = @import("disasm.zig").disasm;
 pub const FlatBus = @import("flatbus.zig").FlatBus;
 
@@ -27,6 +36,7 @@ pub const LineEntry = assembler.LineEntry;
 test {
     _ = isa;
     _ = @import("cpu.zig");
+    _ = @import("vcpu.zig");
     _ = @import("disasm.zig");
     _ = @import("flatbus.zig");
     _ = @import("asm.zig");

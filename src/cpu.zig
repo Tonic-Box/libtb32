@@ -61,7 +61,7 @@ inline fn busRead16(bus: anytype, a: u32) ?u16 {
     const b1 = bus.read8(a +% 1) orelse return null;
     return @as(u16, b0) | (@as(u16, b1) << 8);
 }
-inline fn busRead32(bus: anytype, a: u32) ?u32 {
+pub inline fn busRead32(bus: anytype, a: u32) ?u32 {
     if (@hasDecl(@TypeOf(bus.*), "read32")) return bus.read32(a);
     var v: u32 = 0;
     inline for (0..4) |i| {
@@ -100,10 +100,16 @@ pub inline fn step(cpu: *Cpu, bus: anytype) Stop {
         return .fault;
     };
     const d = isa.decode(word);
+    return execOne(cpu, bus, d, ipc);
+}
+
+/// Executes an already-fetched, decoded instruction whose bytes begin at `ipc`, advancing
+/// `pc` and returning why it stopped. Shared by `step` and the privileged executor.
+pub inline fn execOne(cpu: *Cpu, bus: anytype, d: isa.Decoded, ipc: u32) Stop {
     const a = cpu.r[d.rs1];
     const b = cpu.r[d.rs2];
     const si = isa.signext16(d.imm16);
-    const boff: u32 = @bitCast(isa.signext25(word) *% 4);
+    const boff: u32 = @bitCast(isa.signext25(d.word) *% 4);
     cpu.pc = ipc +% 4;
     switch (d.op) {
         isa.ADD => cpu.setReg(d.rd, a +% b),
