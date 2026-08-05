@@ -332,7 +332,7 @@ fn walkStage1(h: *Hart, phys: anytype, gva: u32, kind: AccessKind, eff_user: boo
 /// stage-1 and stage-2 are active. Returns null and records the fault on a page fault.
 fn xlate(h: *Hart, phys: anytype, gva: u32, kind: AccessKind) ?u32 {
     h.mmu_fault = false;
-    const s1 = satpEnabled(h);
+    const s1 = h.v and satpEnabled(h);
     const s2 = h.v and hgatpEnabled(h);
     if (!s1 and !s2) return gva;
     var gpa = gva;
@@ -951,4 +951,21 @@ test "flags restored through the CSR drive a conditional branch" {
     try std.testing.expectEqual(VStop.halt, runToStop(&h, &bus));
     try std.testing.expectEqual(@as(u32, 0), h.cpu.r[5]);
     try std.testing.expectEqual(@as(u32, 0x22), h.cpu.r[6]);
+}
+
+test "stage-1 translation applies to guests but not the hypervisor" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    const ram = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(ram);
+    @memset(ram, 0);
+    var bus = FlatBus{ .ram = ram };
+
+    var nf: u32 = 16;
+    ptMap(ram, 2 << 12, 0x5000, 0x8000, PTE_R | PTE_W | PTE_X, &nf);
+
+    var h = Hart{ .mode = .supervisor, .v = false };
+    h.csr.satp = (1 << 31) | 2;
+    try std.testing.expectEqual(@as(u32, 0x5000), xlate(&h, &bus, 0x5000, .load).?);
+    h.v = true;
+    try std.testing.expectEqual(@as(u32, 0x8000), xlate(&h, &bus, 0x5000, .load).?);
 }
