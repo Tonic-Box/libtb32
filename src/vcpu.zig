@@ -69,6 +69,7 @@ pub const CSR_HGATP: u16 = 0x680;
 const SSTATUS_SIE: u32 = 1 << 1;
 const SSTATUS_SPIE: u32 = 1 << 5;
 const SSTATUS_SPP: u32 = 1 << 8;
+const SSTATUS_SUM: u32 = 1 << 18; // permit Supervisor access to User pages (load/store, not fetch)
 
 const HSTATUS_SPV: u32 = 1 << 0;
 
@@ -94,6 +95,7 @@ pub const Csr = struct {
     sie: bool = false,
     spie: bool = false,
     spp: Mode = .user,
+    sum: bool = false,
 };
 
 /// The hypervisor control and status registers, including the exception delegation mask, the
@@ -239,19 +241,31 @@ fn hgatpEnabled(h: *Hart) bool {
     return (h.hcsr.hgatp >> 31) != 0;
 }
 
-fn permOk(pte: u32, kind: AccessKind, eff_user: bool) bool {
+fn permOk(pte: u32, kind: AccessKind, user: bool, sum: bool) bool {
     const need: u32 = switch (kind) {
         .fetch => PTE_X,
         .load => PTE_R,
         .store => PTE_W,
     };
     if (pte & need == 0) return false;
-    if (eff_user) {
-        if (pte & PTE_U == 0) return false;
-    } else {
-        if (pte & PTE_U != 0) return false;
-    }
+    const is_u = pte & PTE_U != 0;
+    if (user) return is_u; // user mode needs the U bit
+    // supervisor mode: a U page is reachable only for load/store, and only when SUM is set;
+    // supervisor never fetches (executes) a user page.
+    if (is_u) return sum and kind != .fetch;
     return true;
+}
+
+test "permOk: SUM lets supervisor load/store user pages but never fetch, users still isolated" {
+    // user reads its own (U) page; supervisor is blocked unless SUM is set.
+    try std.testing.expect(permOk(PTE_R | PTE_U, .load, true, false));
+    try std.testing.expect(!permOk(PTE_R | PTE_U, .load, false, false));
+    try std.testing.expect(permOk(PTE_R | PTE_U, .load, false, true));
+    // supervisor never executes a user page, even with SUM.
+    try std.testing.expect(!permOk(PTE_X | PTE_U, .fetch, false, true));
+    // supervisor's own (non-U) page: supervisor ok, user blocked.
+    try std.testing.expect(permOk(PTE_R, .load, false, false));
+    try std.testing.expect(!permOk(PTE_R, .load, true, false));
 }
 
 fn permS2(pte: u32, kind: AccessKind) bool {
@@ -313,7 +327,7 @@ fn gpaRead32(h: *Hart, phys: anytype, gpa: u32) ?u32 {
 }
 
 /// Walks the stage-1 (guest-virtual to guest-physical) tables, reading entries through stage-2.
-fn walkStage1(h: *Hart, phys: anytype, gva: u32, kind: AccessKind, eff_user: bool) ?u32 {
+fn walkStage1(h: *Hart, phys: anytype, gva: u32, kind: AccessKind, user: bool, sum: bool) ?u32 {
     const root = (h.csr.satp & 0xFFFFF) << 12;
     const e1 = gpaRead32(h, phys, root +% ((gva >> 22) & 0x3FF) *% 4) orelse return null;
     if (e1 & PTE_V == 0 or (e1 & (PTE_R | PTE_W | PTE_X)) != 0) {
@@ -321,7 +335,7 @@ fn walkStage1(h: *Hart, phys: anytype, gva: u32, kind: AccessKind, eff_user: boo
         return null;
     }
     const e2 = gpaRead32(h, phys, (e1 & 0xFFFFF000) +% ((gva >> 12) & 0x3FF) *% 4) orelse return null;
-    if (e2 & PTE_V == 0 or !permOk(e2, kind, eff_user)) {
+    if (e2 & PTE_V == 0 or !permOk(e2, kind, user, sum)) {
         setFault(h, spfCause(kind), gva);
         return null;
     }
@@ -337,7 +351,7 @@ fn xlate(h: *Hart, phys: anytype, gva: u32, kind: AccessKind) ?u32 {
     if (!s1 and !s2) return gva;
     var gpa = gva;
     if (s1) {
-        gpa = walkStage1(h, phys, gva, kind, h.mode == .user) orelse return null;
+        gpa = walkStage1(h, phys, gva, kind, h.mode == .user, h.csr.sum) orelse return null;
     }
     if (s2) {
         return walkStage2(h, phys, gpa, kind) orelse return null;
@@ -365,7 +379,7 @@ fn TransBus(comptime P: type) type {
 
 fn csrRead(h: *Hart, csr: u16) ?u32 {
     return switch (csr) {
-        CSR_SSTATUS => (if (h.csr.sie) SSTATUS_SIE else 0) | (if (h.csr.spie) SSTATUS_SPIE else 0) | (if (h.csr.spp == .supervisor) SSTATUS_SPP else 0),
+        CSR_SSTATUS => (if (h.csr.sie) SSTATUS_SIE else 0) | (if (h.csr.spie) SSTATUS_SPIE else 0) | (if (h.csr.spp == .supervisor) SSTATUS_SPP else 0) | (if (h.csr.sum) SSTATUS_SUM else 0),
         CSR_SFLAGS => (if (h.cpu.f.z) @as(u32, 1) else 0) | (if (h.cpu.f.n) @as(u32, 2) else 0) | (if (h.cpu.f.c) @as(u32, 4) else 0) | (if (h.cpu.f.v) @as(u32, 8) else 0),
         CSR_STVEC => h.csr.stvec,
         CSR_SSCRATCH => h.csr.sscratch,
@@ -396,6 +410,7 @@ fn csrWrite(h: *Hart, csr: u16, v: u32) bool {
             h.csr.sie = (v & SSTATUS_SIE) != 0;
             h.csr.spie = (v & SSTATUS_SPIE) != 0;
             h.csr.spp = if ((v & SSTATUS_SPP) != 0) .supervisor else .user;
+            h.csr.sum = (v & SSTATUS_SUM) != 0;
         },
         CSR_SFLAGS => {
             h.cpu.f.z = (v & 1) != 0;
