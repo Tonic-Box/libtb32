@@ -75,7 +75,7 @@ inline fn busWrite16(bus: anytype, a: u32, v: u16) bool {
     if (!bus.write8(a, @truncate(v))) return false;
     return bus.write8(a +% 1, @truncate(v >> 8));
 }
-inline fn busWrite32(bus: anytype, a: u32, v: u32) bool {
+pub inline fn busWrite32(bus: anytype, a: u32, v: u32) bool {
     if (@hasDecl(@TypeOf(bus.*), "write32")) return bus.write32(a, v);
     inline for (0..4) |i| {
         if (!bus.write8(a +% @as(u32, i), @truncate(v >> @as(u5, @intCast(i * 8))))) return false;

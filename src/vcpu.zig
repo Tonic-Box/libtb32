@@ -53,6 +53,8 @@ pub const CSR_SCAUSE: u16 = 0x142;
 pub const CSR_STVAL: u16 = 0x143;
 pub const CSR_SIP: u16 = 0x144;
 pub const CSR_STIMECMP: u16 = 0x14D;
+pub const CSR_TIME: u16 = 0x14E;
+pub const CSR_SSTEP: u16 = 0x14F;
 pub const CSR_SATP: u16 = 0x180;
 
 pub const CSR_HSTATUS: u16 = 0x600;
@@ -116,6 +118,12 @@ pub const Hcsr = struct {
 
 /// A hardware thread: the base CPU state plus its privilege mode, virtualization bit, the
 /// supervisor and hypervisor register banks, and the most recent MMU fault detail.
+/// One cached stage-1+stage-2 translation: a guest-virtual page (`tag`) to its host-physical page
+/// (`ppn`), plus the stage-1 leaf PTE so permission checks are re-validated without a re-walk.
+/// `gen` distinguishes live entries from stale ones after a flush.
+const TlbEntry = struct { tag: u32 = 0, ppn: u32 = 0, pte: u32 = 0, gen: u32 = 0 };
+const TLB_SIZE: u32 = 1024;
+
 pub const Hart = struct {
     cpu: base.Cpu = .{},
     mode: Mode = .supervisor,
@@ -126,7 +134,16 @@ pub const Hart = struct {
     mmu_cause: u32 = 0,
     mmu_tval: u32 = 0,
     time: u32 = 0,
+    sstep: u32 = 0,
+    tlb: [TLB_SIZE]TlbEntry = [_]TlbEntry{.{}} ** TLB_SIZE,
+    tlb_gen: u32 = 1,
 };
+
+/// Invalidate every cached translation (bumping the generation makes all entries stale). Called
+/// whenever the address space or its mappings change: any write to satp or hgatp.
+fn tlbFlush(h: *Hart) void {
+    h.tlb_gen +%= 1;
+}
 
 fn atLeast(mode: Mode, need: Mode) bool {
     return @intFromEnum(mode) >= @intFromEnum(need);
@@ -301,9 +318,17 @@ fn walkStage2(h: *Hart, phys: anytype, gpa: u32, kind: AccessKind) ?u32 {
         setFault(h, gpfCause(kind), gpa);
         return null;
     };
-    if (e1 & PTE_V == 0 or (e1 & (PTE_R | PTE_W | PTE_X)) != 0) {
+    if (e1 & PTE_V == 0) {
         setFault(h, gpfCause(kind), gpa);
         return null;
+    }
+    if (e1 & (PTE_R | PTE_W | PTE_X) != 0) {
+        // A valid L1 entry carrying permission bits is a 4 MB superpage leaf.
+        if (!permS2(e1, kind)) {
+            setFault(h, gpfCause(kind), gpa);
+            return null;
+        }
+        return (e1 & 0xFFC00000) | (gpa & 0x3FFFFF);
     }
     const e2 = base.busRead32(phys, (e1 & 0xFFFFF000) +% ((gpa >> 12) & 0x3FF) *% 4) orelse {
         setFault(h, gpfCause(kind), gpa);
@@ -327,18 +352,28 @@ fn gpaRead32(h: *Hart, phys: anytype, gpa: u32) ?u32 {
 }
 
 /// Walks the stage-1 (guest-virtual to guest-physical) tables, reading entries through stage-2.
-fn walkStage1(h: *Hart, phys: anytype, gva: u32, kind: AccessKind, user: bool, sum: bool) ?u32 {
+fn walkStage1(h: *Hart, phys: anytype, gva: u32, kind: AccessKind, user: bool, sum: bool, leaf: *u32) ?u32 {
     const root = (h.csr.satp & 0xFFFFF) << 12;
     const e1 = gpaRead32(h, phys, root +% ((gva >> 22) & 0x3FF) *% 4) orelse return null;
-    if (e1 & PTE_V == 0 or (e1 & (PTE_R | PTE_W | PTE_X)) != 0) {
+    if (e1 & PTE_V == 0) {
         setFault(h, spfCause(kind), gva);
         return null;
+    }
+    if (e1 & (PTE_R | PTE_W | PTE_X) != 0) {
+        // A valid L1 entry carrying permission bits is a 4 MB superpage leaf.
+        if (!permOk(e1, kind, user, sum)) {
+            setFault(h, spfCause(kind), gva);
+            return null;
+        }
+        leaf.* = e1;
+        return (e1 & 0xFFC00000) | (gva & 0x3FFFFF);
     }
     const e2 = gpaRead32(h, phys, (e1 & 0xFFFFF000) +% ((gva >> 12) & 0x3FF) *% 4) orelse return null;
     if (e2 & PTE_V == 0 or !permOk(e2, kind, user, sum)) {
         setFault(h, spfCause(kind), gva);
         return null;
     }
+    leaf.* = e2;
     return (e2 & 0xFFFFF000) | (gva & 0xFFF);
 }
 
@@ -349,9 +384,27 @@ fn xlate(h: *Hart, phys: anytype, gva: u32, kind: AccessKind) ?u32 {
     const s1 = h.v and satpEnabled(h);
     const s2 = h.v and hgatpEnabled(h);
     if (!s1 and !s2) return gva;
+    // Fast path: both stages active (the guest case). Cache the composite gva->hpa translation in
+    // the TLB so hot pages skip the multi-level nested walk. Stage-2 maps guest RAM uniformly, so
+    // caching gva->hpa is kind-independent; the stage-1 leaf PTE is re-checked for permissions.
+    if (s1 and s2) {
+        const vpn = gva >> 12;
+        const ent = &h.tlb[vpn & (TLB_SIZE - 1)];
+        if (ent.gen == h.tlb_gen and ent.tag == vpn) {
+            if (permOk(ent.pte, kind, h.mode == .user, h.csr.sum)) return (ent.ppn << 12) | (gva & 0xFFF);
+            setFault(h, spfCause(kind), gva);
+            return null;
+        }
+        var leaf: u32 = 0;
+        const gpa = walkStage1(h, phys, gva, kind, h.mode == .user, h.csr.sum, &leaf) orelse return null;
+        const hpa = walkStage2(h, phys, gpa, kind) orelse return null;
+        ent.* = .{ .tag = vpn, .ppn = hpa >> 12, .pte = leaf, .gen = h.tlb_gen };
+        return hpa;
+    }
     var gpa = gva;
+    var leaf: u32 = 0;
     if (s1) {
-        gpa = walkStage1(h, phys, gva, kind, h.mode == .user, h.csr.sum) orelse return null;
+        gpa = walkStage1(h, phys, gva, kind, h.mode == .user, h.csr.sum, &leaf) orelse return null;
     }
     if (s2) {
         return walkStage2(h, phys, gpa, kind) orelse return null;
@@ -374,6 +427,28 @@ fn TransBus(comptime P: type) type {
             const pa = xlate(self.h, self.phys, a, .store) orelse return false;
             return self.phys.write8(pa, val);
         }
+        pub fn read32(self: *Self, a: u32) ?u32 {
+            if ((a & 0xFFF) <= 0xFFC) {
+                const pa = xlate(self.h, self.phys, a, .load) orelse return null;
+                return base.busRead32(self.phys, pa);
+            }
+            var v: u32 = 0;
+            inline for (0..4) |i| {
+                const b = self.read8(a +% @as(u32, i)) orelse return null;
+                v |= @as(u32, b) << @as(u5, @intCast(i * 8));
+            }
+            return v;
+        }
+        pub fn write32(self: *Self, a: u32, val: u32) bool {
+            if ((a & 0xFFF) <= 0xFFC) {
+                const pa = xlate(self.h, self.phys, a, .store) orelse return false;
+                return base.busWrite32(self.phys, pa, val);
+            }
+            inline for (0..4) |i| {
+                if (!self.write8(a +% @as(u32, i), @truncate(val >> @as(u5, @intCast(i * 8))))) return false;
+            }
+            return true;
+        }
     };
 }
 
@@ -390,6 +465,8 @@ fn csrRead(h: *Hart, csr: u16) ?u32 {
         CSR_SIE => h.csr.sie_mask,
         CSR_SIP => h.csr.sip,
         CSR_STIMECMP => h.csr.stimecmp,
+        CSR_TIME => h.time,
+        CSR_SSTEP => h.sstep,
         CSR_HSTATUS => (if (h.hcsr.spv) HSTATUS_SPV else 0) | (@as(u32, @intFromEnum(h.hcsr.hpp)) << 1),
         CSR_HEDELEG => h.hcsr.hedeleg,
         CSR_HTVEC => h.hcsr.htvec,
@@ -423,10 +500,14 @@ fn csrWrite(h: *Hart, csr: u16, v: u32) bool {
         CSR_SEPC => h.csr.sepc = v,
         CSR_SCAUSE => h.csr.scause = v,
         CSR_STVAL => h.csr.stval = v,
-        CSR_SATP => h.csr.satp = v,
+        CSR_SATP => {
+            h.csr.satp = v;
+            tlbFlush(h);
+        },
         CSR_SIE => h.csr.sie_mask = v,
         CSR_SIP => h.csr.sip = v,
         CSR_STIMECMP => h.csr.stimecmp = v,
+        CSR_SSTEP => h.sstep = v,
         CSR_HSTATUS => {
             h.hcsr.spv = (v & HSTATUS_SPV) != 0;
             const pp: u32 = (v >> 1) & 3;
@@ -440,7 +521,10 @@ fn csrWrite(h: *Hart, csr: u16, v: u32) bool {
         CSR_HTVAL => h.hcsr.htval = v,
         CSR_HTINST => h.hcsr.htinst = v,
         CSR_HTIMECMP => h.hcsr.htimecmp = v,
-        CSR_HGATP => h.hcsr.hgatp = v,
+        CSR_HGATP => {
+            h.hcsr.hgatp = v;
+            tlbFlush(h);
+        },
         else => return false,
     }
     return true;
@@ -453,7 +537,21 @@ fn setReg(h: *Hart, rd: u4, v: u32) void {
 /// Executes one instruction with privilege enforcement, trap delivery, and address
 /// translation. Base instructions run through `execOne` over a translating bus; `sys` and
 /// faults become traps routed by delegation.
+/// Steps the virtualized hart. When `sstep` is armed (nonzero, set via CSR_SSTEP), it counts down
+/// once per retired guest-user instruction and raises a supervisor timer interrupt when it reaches
+/// zero - a precise single-step primitive for an in-guest debugger. Disabled (sstep==0) by default,
+/// so the non-debug path is unchanged.
 pub fn stepV(h: *Hart, bus: anytype) VStop {
+    const stepping = h.sstep > 0 and h.v and h.mode == .user;
+    const r = stepVInner(h, bus);
+    if (stepping and r == .ok and h.sstep > 0) {
+        h.sstep -= 1;
+        if (h.sstep == 0) h.csr.sip |= IRQ_TIMER;
+    }
+    return r;
+}
+
+fn stepVInner(h: *Hart, bus: anytype) VStop {
     const cpu = &h.cpu;
     if (h.v and h.hcsr.htimecmp != 0 and h.time >= h.hcsr.htimecmp) {
         takeHtimer(h);
@@ -764,6 +862,25 @@ test "two-stage walk composes guest and hypervisor page tables" {
     h.csr.satp = (1 << 31) | 2;
     h.hcsr.hgatp = (1 << 31) | 1;
     try std.testing.expectEqual(@as(u32, 0xC000), xlate(&h, &bus, 0x5000, .store).?);
+}
+
+test "stage-1 4MB superpage resolves within the megapage and enforces permissions" {
+    const FlatBus = @import("flatbus.zig").FlatBus;
+    const ram = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(ram);
+    @memset(ram, 0);
+    var bus = FlatBus{ .ram = ram };
+
+    // stage-1 root at frame 2 (0x2000): L1[1] is a 4 MB RW superpage leaf mapping [0x400000,0x800000)
+    // to physical [0x800000,0xC00000). Permission bits on an L1 entry make it a leaf.
+    const root: u32 = 2 << 12;
+    put(ram, root + 1 * 4, 0x00800000 | PTE_R | PTE_W | PTE_V);
+
+    var h = Hart{ .mode = .supervisor, .v = true }; // s1 only (hgatp disabled)
+    h.csr.satp = (1 << 31) | 2;
+    try std.testing.expectEqual(@as(u32, 0x812345), xlate(&h, &bus, 0x412345, .load).?);
+    try std.testing.expectEqual(@as(u32, 0x800000), xlate(&h, &bus, 0x400000, .store).?);
+    try std.testing.expect(xlate(&h, &bus, 0x400000, .fetch) == null); // no X bit -> fetch faults
 }
 
 test "guest fetch and store run through the MMU with per-VM isolation" {
